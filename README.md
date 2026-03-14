@@ -1,2 +1,2 @@
 # glitch-catalog
-Glitch Catalog — Session archive and replay app for the Joebot ecosystem
+Glitch Catalog — Session archive and replay app for the Joebot Ecosystem
