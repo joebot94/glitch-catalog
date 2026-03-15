@@ -647,20 +647,26 @@ final class CatalogState: ObservableObject {
         ])
     }
 
-    func replaySnapshotToHardware(_ snapshot: [String: Any], at positionMs: Double) {
+    func replaySnapshotToHardware(_ snapshot: [String: Any], at positionMs: Double, shouldToast: Bool = true) {
         guard nexusClient.isConnected else {
-            showToast("Connect to Nexus to replay to hardware")
+            if shouldToast {
+                showToast("Connect to Nexus to replay to hardware")
+            }
             return
         }
         guard !snapshot.isEmpty else {
-            showToast("No state available at this moment")
+            if shouldToast {
+                showToast("No state available at this moment")
+            }
             return
         }
 
         nexusClient.sendMessage(type: "scene_recall", payload: [
             "snapshot": snapshot,
         ])
-        showToast("State restored to \(clockString(from: positionMs))")
+        if shouldToast {
+            showToast("State restored to \(clockString(from: positionMs))")
+        }
     }
 
     func exportReplayMoment(snapshot: [String: Any], name: String, positionMs: Double) {

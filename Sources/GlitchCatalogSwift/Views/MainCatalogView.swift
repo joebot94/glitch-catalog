@@ -1448,6 +1448,7 @@ private struct ReplaySessionSheet: View {
     @State private var playbackSpeed: Double = 1.0
     @State private var showingExportSheet = false
     @State private var exportName = ""
+    @State private var replayAllEventsToHardware = false
 
     private let timer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
     private let speedOptions: [Double] = [0.5, 1.0, 2.0, 4.0]
@@ -1559,6 +1560,8 @@ private struct ReplaySessionSheet: View {
                 }
             }
 
+            replayAllEventsRow
+
             VStack(alignment: .leading, spacing: 8) {
                 Text("Current state at this moment:")
                     .font(.system(size: 12, weight: .bold, design: .monospaced))
@@ -1628,6 +1631,13 @@ private struct ReplaySessionSheet: View {
                 positionMs = totalDurationMs
             }
         }
+        .onChange(of: isPlaying) { _, nowPlaying in
+            guard nowPlaying else { return }
+            guard replayAllEventsToHardware else { return }
+            guard state.nexusClient.isConnected else { return }
+            guard !moment.snapshot.isEmpty else { return }
+            state.replaySnapshotToHardware(moment.snapshot, at: positionMs, shouldToast: false)
+        }
         .onReceive(timer) { _ in
             guard isPlaying else { return }
             guard totalDurationMs > 0 else {
@@ -1639,7 +1649,10 @@ private struct ReplaySessionSheet: View {
                 isPlaying = false
                 return
             }
-            positionMs = min(totalDurationMs, positionMs + (50.0 * playbackSpeed))
+            let previousPosition = positionMs
+            let nextPosition = min(totalDurationMs, previousPosition + (50.0 * playbackSpeed))
+            positionMs = nextPosition
+            streamTimelineRangeToHardware(from: previousPosition, to: nextPosition)
             if positionMs >= totalDurationMs {
                 isPlaying = false
             }
@@ -1660,6 +1673,36 @@ private struct ReplaySessionSheet: View {
         }
         let delta = max(0, next.relativeMs - positionMs)
         return "Next event: \(next.entry.summary) (in \(state.clockString(from: delta)))"
+    }
+
+    private var replayAllEventsRow: some View {
+        Toggle(isOn: $replayAllEventsToHardware) {
+            Text("Replay all events to hardware")
+                .font(.system(size: 12, design: .monospaced))
+                .foregroundStyle(theme.text)
+        }
+        .disabled(!state.nexusClient.isConnected || timeline.isEmpty)
+        .help(state.nexusClient.isConnected
+            ? "When enabled, Play sends each timeline event state to Nexus as replay advances"
+            : "Connect to Nexus to replay timeline events to hardware")
+    }
+
+    private func streamTimelineRangeToHardware(from startMs: Double, to endMs: Double) {
+        guard replayAllEventsToHardware else { return }
+        guard state.nexusClient.isConnected else { return }
+        guard endMs >= startMs else { return }
+        guard !timeline.isEmpty else { return }
+
+        let crossedEvents = timeline.filter { event in
+            event.relativeMs > startMs && event.relativeMs <= endMs
+        }
+        guard !crossedEvents.isEmpty else { return }
+
+        for event in crossedEvents {
+            let eventMoment = ReplayEngine.reconstruct(at: event.relativeMs, timeline: timeline)
+            guard !eventMoment.snapshot.isEmpty else { continue }
+            state.replaySnapshotToHardware(eventMoment.snapshot, at: event.relativeMs, shouldToast: false)
+        }
     }
 }
 
