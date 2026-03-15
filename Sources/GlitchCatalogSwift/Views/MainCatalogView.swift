@@ -1405,6 +1405,76 @@ private enum ReplayEngine {
         )
     }
 
+    static func buildCheckpoints(
+        from timeline: [ReplayTimelineEvent],
+        interval: Int = 40
+    ) -> (indices: [Int], snapshots: [[String: Any]]) {
+        let safeInterval = max(1, interval)
+        var indices: [Int] = [-1]
+        var snapshots: [[String: Any]] = [[:]]
+
+        guard !timeline.isEmpty else {
+            return (indices, snapshots)
+        }
+
+        var snapshot: [String: Any] = [:]
+        for (idx, event) in timeline.enumerated() {
+            apply(event: event, to: &snapshot)
+            if ((idx + 1) % safeInterval == 0) || idx == timeline.count - 1 {
+                indices.append(idx)
+                snapshots.append(snapshot)
+            }
+        }
+
+        return (indices, snapshots)
+    }
+
+    static func reconstruct(
+        at positionMs: Double,
+        timeline: [ReplayTimelineEvent],
+        checkpointIndices: [Int],
+        checkpointSnapshots: [[String: Any]]
+    ) -> ReplayMomentState {
+        guard !timeline.isEmpty else {
+            return ReplayMomentState(snapshot: [:], channels: [], lastEvent: nil, nextEvent: nil)
+        }
+
+        let insertionIndex = upperBound(for: positionMs, timeline: timeline)
+        let lastEventIndex = insertionIndex - 1
+        let nextEvent = insertionIndex < timeline.count ? timeline[insertionIndex] : nil
+        guard lastEventIndex >= 0 else {
+            return ReplayMomentState(snapshot: [:], channels: [], lastEvent: nil, nextEvent: nextEvent)
+        }
+
+        var checkpointSlot = upperBound(for: lastEventIndex, sortedInts: checkpointIndices) - 1
+        if checkpointSlot < 0 || checkpointSlot >= checkpointSnapshots.count {
+            checkpointSlot = 0
+        }
+
+        var snapshot = checkpointSnapshots[checkpointSlot]
+        let startIndex = checkpointIndices[checkpointSlot] + 1
+        if startIndex <= lastEventIndex {
+            for idx in startIndex ... lastEventIndex {
+                apply(event: timeline[idx], to: &snapshot)
+            }
+        }
+
+        return ReplayMomentState(
+            snapshot: snapshot,
+            channels: extractChannels(from: snapshot),
+            lastEvent: timeline[lastEventIndex],
+            nextEvent: nextEvent
+        )
+    }
+
+    static func lastEventIndex(atOrBefore positionMs: Double, timeline: [ReplayTimelineEvent]) -> Int {
+        upperBound(for: positionMs, timeline: timeline) - 1
+    }
+
+    static func applyEvent(_ event: ReplayTimelineEvent, to snapshot: inout [String: Any]) {
+        apply(event: event, to: &snapshot)
+    }
+
     private static func resolvedRelativeMs(for entry: EventLogEntry, startEpoch: Double) -> Double {
         if let value = entry.relativeMS {
             return max(0, value)
@@ -1508,6 +1578,34 @@ private enum ReplayEngine {
         }
         return nil
     }
+
+    private static func upperBound(for positionMs: Double, timeline: [ReplayTimelineEvent]) -> Int {
+        var low = 0
+        var high = timeline.count
+        while low < high {
+            let mid = (low + high) / 2
+            if timeline[mid].relativeMs <= positionMs {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
+
+    private static func upperBound(for value: Int, sortedInts: [Int]) -> Int {
+        var low = 0
+        var high = sortedInts.count
+        while low < high {
+            let mid = (low + high) / 2
+            if sortedInts[mid] <= value {
+                low = mid + 1
+            } else {
+                high = mid
+            }
+        }
+        return low
+    }
 }
 
 private struct ReplaySessionSheet: View {
@@ -1526,6 +1624,10 @@ private struct ReplaySessionSheet: View {
     @State private var momentState = ReplayMomentState(snapshot: [:], channels: [], lastEvent: nil, nextEvent: nil)
     @State private var streamEvents: [ReplayTimelineEvent] = []
     @State private var replayAllEventsToHardware = false
+    @State private var checkpointIndices: [Int] = [-1]
+    @State private var checkpointSnapshots: [[String: Any]] = [[:]]
+    @State private var isPreparingReplay = true
+    @State private var lastHardwarePushAt: Date = .distantPast
 
     private let timer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
     private let speedOptions: [Double] = [0.5, 1.0, 2.0, 4.0]
@@ -1559,6 +1661,12 @@ private struct ReplaySessionSheet: View {
             Text("\(session.title) — \(session.date)")
                 .font(.system(size: 13, weight: .bold, design: .monospaced))
                 .foregroundStyle(theme.accent)
+
+            if isPreparingReplay {
+                Text("Preparing replay timeline...")
+                    .font(.system(size: 12, design: .monospaced))
+                    .foregroundStyle(theme.muted)
+            }
 
             VStack(spacing: 6) {
                 if totalDurationMs > 0 {
@@ -1745,15 +1853,10 @@ private struct ReplaySessionSheet: View {
         .frame(minWidth: 760, minHeight: 520)
         .background(theme.background)
         .onAppear {
-            timeline = ReplayEngine.timeline(from: eventLog)
-            streamEvents = Array(timeline.suffix(120))
-            if totalDurationMs <= 0 {
-                positionMs = 0
-                isPlaying = false
-            } else if positionMs > totalDurationMs {
-                positionMs = totalDurationMs
-            }
-            refreshMomentState()
+            prepareReplayData()
+        }
+        .onChange(of: eventLog.startedAt) { _, _ in
+            prepareReplayData()
         }
         .onChange(of: positionMs) { _, _ in
             refreshMomentState()
@@ -1800,7 +1903,12 @@ private struct ReplaySessionSheet: View {
     }
 
     private func refreshMomentState() {
-        momentState = ReplayEngine.reconstruct(at: positionMs, timeline: timeline)
+        momentState = ReplayEngine.reconstruct(
+            at: positionMs,
+            timeline: timeline,
+            checkpointIndices: checkpointIndices,
+            checkpointSnapshots: checkpointSnapshots
+        )
     }
 
     private var lastSnapshotPositionMs: Double? {
@@ -1858,16 +1966,44 @@ private struct ReplaySessionSheet: View {
         guard endMs >= startMs else { return }
         guard !timeline.isEmpty else { return }
 
-        let crossedEvents = timeline.filter { event in
-            event.relativeMs > startMs && event.relativeMs <= endMs
-        }
-        guard !crossedEvents.isEmpty else { return }
+        let startIndex = ReplayEngine.lastEventIndex(atOrBefore: startMs, timeline: timeline)
+        let endIndex = ReplayEngine.lastEventIndex(atOrBefore: endMs, timeline: timeline)
+        guard endIndex > startIndex else { return }
 
-        for event in crossedEvents {
-            let eventMoment = ReplayEngine.reconstruct(at: event.relativeMs, timeline: timeline)
-            guard !eventMoment.snapshot.isEmpty else { continue }
-            state.replaySnapshotToHardware(eventMoment.snapshot, at: event.relativeMs, shouldToast: false)
+        var rollingSnapshot = momentState.snapshot
+        let lowerBound = max(0, startIndex + 1)
+        for idx in lowerBound ... endIndex {
+            let event = timeline[idx]
+            ReplayEngine.applyEvent(event, to: &rollingSnapshot)
+
+            // Keep hardware replay responsive under heavy event bursts.
+            let now = Date()
+            if now.timeIntervalSince(lastHardwarePushAt) < 0.03, idx < endIndex {
+                continue
+            }
+            guard !rollingSnapshot.isEmpty else { continue }
+            lastHardwarePushAt = now
+            state.replaySnapshotToHardware(rollingSnapshot, at: event.relativeMs, shouldToast: false)
         }
+    }
+
+    private func prepareReplayData() {
+        isPreparingReplay = true
+        isPlaying = false
+        let builtTimeline = ReplayEngine.timeline(from: eventLog)
+        let checkpoints = ReplayEngine.buildCheckpoints(from: builtTimeline, interval: 40)
+
+        timeline = builtTimeline
+        checkpointIndices = checkpoints.indices
+        checkpointSnapshots = checkpoints.snapshots
+        streamEvents = Array(builtTimeline.suffix(120))
+        if totalDurationMs <= 0 {
+            positionMs = 0
+        } else if positionMs > totalDurationMs {
+            positionMs = totalDurationMs
+        }
+        refreshMomentState()
+        isPreparingReplay = false
     }
 }
 
