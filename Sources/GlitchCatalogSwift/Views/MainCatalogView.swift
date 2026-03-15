@@ -167,7 +167,7 @@ struct MainCatalogView: View {
 
     private var replayIsAvailable: Bool {
         guard let log = state.eventLog else { return false }
-        return ReplayEngine.durationMs(from: log) > 0
+        return log.durationMs > 0
     }
 
     var body: some View {
@@ -362,7 +362,7 @@ struct MainCatalogView: View {
             }
         }
         .sheet(isPresented: $showingReplaySheet) {
-            if let session = state.selectedSession, let log = state.eventLog, ReplayEngine.durationMs(from: log) > 0 {
+            if let session = state.selectedSession, let log = state.eventLog, log.durationMs > 0 {
                 ReplaySessionSheet(state: state, session: session, eventLog: log, theme: theme)
             } else {
                 VStack(spacing: 10) {
@@ -624,7 +624,7 @@ struct MainCatalogView: View {
                                         Text(state.prettyTimestamp(replay.startedAt))
                                             .font(.system(size: 11, design: .monospaced))
                                             .foregroundStyle(theme.muted)
-                                        Text("dur \(state.clockString(from: ReplayEngine.durationMs(from: replay))) • events \(replay.events.count)")
+                                        Text("dur \(state.clockString(from: replay.durationMs)) • events \(replay.events.count)")
                                             .font(.system(size: 11, design: .monospaced))
                                             .foregroundStyle(theme.muted)
                                     }
@@ -646,7 +646,7 @@ struct MainCatalogView: View {
                                         showingReplaySheet = true
                                     }
                                     .buttonStyle(RetroButtonStyle(theme: theme))
-                                    .disabled(ReplayEngine.durationMs(from: replay) <= 0)
+                                    .disabled(replay.durationMs <= 0)
 
                                     Button("Delete") {
                                         state.deleteReplay(replay.replayID)
@@ -1337,7 +1337,8 @@ private struct ReplayTimelineEvent: Identifiable {
     let id: String
     let relativeMs: Double
     let entry: EventLogEntry
-    let payload: [String: Any]
+    let statePayload: [String: Any]?
+    let snapshotPayload: [String: Any]?
 }
 
 private struct ReplayChannelState: Identifiable, Hashable {
@@ -1356,30 +1357,46 @@ private struct ReplayMomentState {
 
 private enum ReplayEngine {
     static func durationMs(from log: EventLogRecord) -> Double {
-        let timelineEvents = timeline(from: log)
-        guard let last = timelineEvents.last?.relativeMs, last.isFinite, last > 0 else {
-            return 0
-        }
-        return last
+        log.durationMs
     }
 
     static func timeline(from log: EventLogRecord) -> [ReplayTimelineEvent] {
         let startEpoch = parseISO(log.startedAt) ?? 0
-        let events = log.events.map { entry -> ReplayTimelineEvent in
+        var events = log.events.map { entry -> ReplayTimelineEvent in
             let relativeMs = resolvedRelativeMs(for: entry, startEpoch: startEpoch)
+            let rawPayload = entry.payload.mapValues { $0.anyValue }
             return ReplayTimelineEvent(
                 id: "\(entry.id)|\(relativeMs)",
                 relativeMs: relativeMs,
                 entry: entry,
-                payload: entry.payload.mapValues { $0.anyValue }
+                statePayload: rawPayload["state"] as? [String: Any],
+                snapshotPayload: rawPayload["snapshot"] as? [String: Any]
             )
         }
-        return events.sorted {
-            if $0.relativeMs == $1.relativeMs {
-                return $0.entry.timestamp < $1.entry.timestamp
+
+        var needsSort = false
+        for idx in 1 ..< events.count {
+            let prev = events[idx - 1]
+            let current = events[idx]
+            if current.relativeMs < prev.relativeMs {
+                needsSort = true
+                break
             }
-            return $0.relativeMs < $1.relativeMs
+            if current.relativeMs == prev.relativeMs, current.entry.timestamp < prev.entry.timestamp {
+                needsSort = true
+                break
+            }
         }
+
+        if needsSort {
+            events.sort {
+                if $0.relativeMs == $1.relativeMs {
+                    return $0.entry.timestamp < $1.entry.timestamp
+                }
+                return $0.relativeMs < $1.relativeMs
+            }
+        }
+        return events
     }
 
     static func reconstruct(at positionMs: Double, timeline: [ReplayTimelineEvent]) -> ReplayMomentState {
@@ -1498,13 +1515,11 @@ private enum ReplayEngine {
     }
 
     private static func apply(event: ReplayTimelineEvent, to snapshot: inout [String: Any]) {
-        let payload = event.payload
-
-        if let state = payload["state"] as? [String: Any] {
+        if let state = event.statePayload {
             snapshot[event.entry.source] = state
         }
 
-        if let mergedSnapshot = payload["snapshot"] as? [String: Any] {
+        if let mergedSnapshot = event.snapshotPayload {
             for (client, value) in mergedSnapshot {
                 if let clientState = value as? [String: Any] {
                     snapshot[client] = clientState
@@ -1628,8 +1643,9 @@ private struct ReplaySessionSheet: View {
     @State private var checkpointSnapshots: [[String: Any]] = [[:]]
     @State private var isPreparingReplay = true
     @State private var lastHardwarePushAt: Date = .distantPast
+    @State private var lastPlaybackTickAt: Date?
 
-    private let timer = Timer.publish(every: 0.1, on: .main, in: .common).autoconnect()
+    private let timer = Timer.publish(every: 0.05, on: .main, in: .common).autoconnect()
     private let speedOptions: [Double] = [0.5, 1.0, 2.0, 4.0]
 
     private var totalDurationMs: Double {
@@ -1711,7 +1727,12 @@ private struct ReplaySessionSheet: View {
 
                 Button(isPlaying ? "⏸" : "▶") {
                     if timeline.isEmpty || totalDurationMs <= 0 { return }
-                    isPlaying.toggle()
+                    if isPlaying {
+                        isPlaying = false
+                    } else {
+                        lastPlaybackTickAt = Date()
+                        isPlaying = true
+                    }
                 }
                 .buttonStyle(RetroButtonStyle(theme: theme))
                 .frame(width: 60)
@@ -1862,6 +1883,11 @@ private struct ReplaySessionSheet: View {
             refreshMomentState()
         }
         .onChange(of: isPlaying) { _, nowPlaying in
+            if nowPlaying {
+                lastPlaybackTickAt = Date()
+            } else {
+                lastPlaybackTickAt = nil
+            }
             guard nowPlaying else { return }
             guard replayAllEventsToHardware else { return }
             guard state.nexusClient.isConnected else { return }
@@ -1870,6 +1896,7 @@ private struct ReplaySessionSheet: View {
         }
         .onReceive(timer) { _ in
             guard isPlaying else { return }
+            guard !isPreparingReplay else { return }
             guard totalDurationMs > 0 else {
                 isPlaying = false
                 positionMs = 0
@@ -1879,8 +1906,17 @@ private struct ReplaySessionSheet: View {
                 isPlaying = false
                 return
             }
+            let now = Date()
+            guard let lastTick = lastPlaybackTickAt else {
+                lastPlaybackTickAt = now
+                return
+            }
+            lastPlaybackTickAt = now
+            let elapsedMs = max(0, now.timeIntervalSince(lastTick) * 1000.0)
+            guard elapsedMs > 0 else { return }
+
             let previousPosition = positionMs
-            let nextPosition = min(totalDurationMs, previousPosition + (100.0 * playbackSpeed))
+            let nextPosition = min(totalDurationMs, previousPosition + (elapsedMs * playbackSpeed))
             positionMs = nextPosition
             streamTimelineRangeToHardware(from: previousPosition, to: nextPosition)
             if positionMs >= totalDurationMs {
@@ -1990,6 +2026,7 @@ private struct ReplaySessionSheet: View {
     private func prepareReplayData() {
         isPreparingReplay = true
         isPlaying = false
+        lastPlaybackTickAt = nil
         let builtTimeline = ReplayEngine.timeline(from: eventLog)
         let checkpoints = ReplayEngine.buildCheckpoints(from: builtTimeline, interval: 40)
 

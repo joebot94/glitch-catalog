@@ -293,6 +293,37 @@ struct EventLogRecord: Codable, Hashable {
     var replayID: String {
         "\(sessionID)|\(startedAt)|\(stoppedAt ?? "")"
     }
+
+    // Fast duration estimate for UI guards/lists without replay timeline reconstruction.
+    var durationMs: Double {
+        let relMax = events.compactMap(\.relativeMS).max() ?? 0
+        if relMax > 0 {
+            return relMax
+        }
+
+        if let startEpoch = Self.parseISO(startedAt), let stoppedAt, let stopEpoch = Self.parseISO(stoppedAt) {
+            return max(0, (stopEpoch - startEpoch) * 1000.0)
+        }
+
+        if let firstTS = events.first?.timestamp, let lastTS = events.last?.timestamp,
+           let firstEpoch = Self.parseISO(firstTS), let lastEpoch = Self.parseISO(lastTS)
+        {
+            return max(0, (lastEpoch - firstEpoch) * 1000.0)
+        }
+        return 0
+    }
+
+    private static func parseISO(_ value: String) -> Double? {
+        let formatter = ISO8601DateFormatter()
+        if let date = formatter.date(from: value) {
+            return date.timeIntervalSince1970
+        }
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        if let date = formatter.date(from: value) {
+            return date.timeIntervalSince1970
+        }
+        return nil
+    }
 }
 
 // One .jbt file contains one session plus its attached entities.
